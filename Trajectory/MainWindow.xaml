@@ -262,7 +262,11 @@
                         <!-- Right: work trajectory list -->
                         <StackPanel Grid.Column="1" Orientation="Vertical" Margin="12,0,0,0">
                             <TextBlock Text="Trajectory Generated" FontWeight="Bold" Margin="0,0,0,6"/>
-                            <ListBox Name="m_work_list" MinHeight="120"/>
+                            <!-- Prevent this list from expanding the layout: limit height and enable internal scrolling -->
+                            <ListBox Name="m_work_list" MinHeight="120" MaxHeight="140"
+                                     ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                     ScrollViewer.CanContentScroll="True"/>
+
                         </StackPanel>
                     </Grid>
                 </GroupBox>
