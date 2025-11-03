@@ -8,6 +8,8 @@ using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
 using System.Globalization;
+using System.Timers;
+using System.Diagnostics;
 
 namespace Trajectory
 {
@@ -17,11 +19,18 @@ namespace Trajectory
     public partial class MainWindow : Window
     {
         // runtime state
-        DispatcherTimer _timer;
+        private System.Timers.Timer _timer;
+        private Stopwatch _stopwatch = new Stopwatch();
+        private readonly object _timerLock = new object();
         int _idx;               // current index in animation
         int _maxIndex;          // last index
         int jenis = 0;          // 0 = Time/Path, 1 = Time/Track (matches original)
         int space = 0;          // 0 = Joint space; 1 = Work space
+
+        // run parameters used by timer logic
+        private int _runTotalMs = 1000;
+        private int _runIntervalMs = 50;
+        private int _runN = 1;
 
         // trajectory/storage arrays (allocated when Calculate pressed)
         double[]? teta1, teta2, teta3;
@@ -82,9 +91,10 @@ namespace Trajectory
             m_joint_list.SelectionChanged += M_joint_list_SelectionChanged;
             m_work_list.SelectionChanged += M_work_list_SelectionChanged;
 
-            // init timer
-            _timer = new DispatcherTimer();
-            _timer.Tick += Timer_Tick;
+            // init timer (use System.Timers.Timer + Stopwatch for higher precision)
+            _timer = new System.Timers.Timer(10); // poll every 10 ms
+            _timer.AutoReset = true;
+            _timer.Elapsed += Timer_Elapsed;
 
             // init serial port object (not opened)
             InitializeSerialPort();
@@ -107,6 +117,18 @@ namespace Trajectory
         // ensure link-length fields reflect UI (with safe defaults)
         private void ReadLinkLengths()
         {
+            // If we're on a non-UI thread, marshal the read to the UI thread.
+            if (!Dispatcher.CheckAccess())
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    if (!double.TryParse(m_a1.Text, out _a1Val) || _a1Val <= 0) _a1Val = 120.0;
+                    if (!double.TryParse(m_a2.Text, out _a2Val) || _a2Val <= 0) _a2Val = 128.0;
+                    if (!double.TryParse(m_a3.Text, out _a3Val) || _a3Val <= 0) _a3Val = 85.0;
+                });
+                return;
+            }
+
             if (!double.TryParse(m_a1.Text, out _a1Val) || _a1Val <= 0) _a1Val = 120.0;
             if (!double.TryParse(m_a2.Text, out _a2Val) || _a2Val <= 0) _a2Val = 128.0;
             if (!double.TryParse(m_a3.Text, out _a3Val) || _a3Val <= 0) _a3Val = 85.0;
@@ -357,8 +379,19 @@ namespace Trajectory
             space = 0;
             _idx = 0;
             _maxIndex = N;
-            _timer.Interval = TimeSpan.FromMilliseconds(intervalMs);
-            _timer.Start();
+
+            // store run params for timer logic
+            _runTotalMs = totalMs;
+            _runIntervalMs = intervalMs;
+            _runN = N;
+
+            // restart stopwatch and start timer (background)
+            lock (_timerLock)
+            {
+                _stopwatch.Restart();
+                _timer.Interval = 10; // poll resolution (ms). Keep small for accurate scheduling.
+                _timer.Start();
+            }
         }
 
         // Work Space Calculate
@@ -444,59 +477,148 @@ namespace Trajectory
             space = 1;
             _idx = 0;
             _maxIndex = N;
-            _timer.Interval = TimeSpan.FromMilliseconds(intervalMs);
-            _timer.Start();
+
+            // store run params for timer logic
+            _runTotalMs = totalMs;
+            _runIntervalMs = intervalMs;
+            _runN = N;
+
+            // restart stopwatch and start timer (background)
+            lock (_timerLock)
+            {
+                _stopwatch.Restart();
+                _timer.Interval = 10; // poll resolution (ms)
+                _timer.Start();
+            }
         }
 
         // ---------------------
-        // Timer tick (acts like WM_TIMER handler)
+        // Timer (background) elapsed handler using Stopwatch for accurate indexing
         // ---------------------
-        private void Timer_Tick(object? sender, EventArgs e)
+        private void Timer_Elapsed(object? sender, ElapsedEventArgs e)
         {
-            int intervalMs = (int)_timer.Interval.TotalMilliseconds;
-            if (intervalMs <= 0) intervalMs = 50;
+            // compute expected sample index based on elapsed time
+            int expectedIdx;
+            long elapsedMs = _stopwatch.ElapsedMilliseconds;
 
-            if (space == 0)
+            lock (_timerLock)
             {
-                // draw using joint arrays
-                if (teta1 == null) return;
-                double a = teta1[_idx], b = teta2[_idx], c = teta3[_idx];
-                ArmDraw(a, b, c);
-
-                // validate before sending
-                if (!ValidateJointAngles(a, b, c, out string reason))
+                if (_runTotalMs <= 0 || _runN <= 0)
                 {
-                    _timer.Stop();
-                    MessageBox.Show($"Joint sample {_idx} invalid: {reason}", "Joint limit", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    expectedIdx = 0;
+                }
+                else
+                {
+                    if (jenis == 1)
+                    {
+                        // Time/Track: total time split across N segments -> map elapsed to index 0..N
+                        double ratio = elapsedMs / (double)_runTotalMs;
+                        expectedIdx = (int)Math.Floor(ratio * _runN);
+                    }
+                    else
+                    {
+                        // Time/Path: interval is treated as per-step (existing app semantics)
+                        if (_runIntervalMs <= 0) expectedIdx = 0;
+                        else expectedIdx = (int)Math.Floor(elapsedMs / (double)_runIntervalMs);
+                    }
+                }
+
+                if (expectedIdx > _maxIndex) expectedIdx = _maxIndex + 1; // indicate done
+                if (expectedIdx <= _idx)
+                {
+                    // nothing new to do
+                    if (expectedIdx > _maxIndex)
+                    {
+                        // stop and cleanup
+                        _stopwatch.Stop();
+                        _timer.Stop();
+                    }
                     return;
                 }
 
-                // send to SSC-32 if connected (only servos 0,2,3)
-                if (_isConnected) SendServos0_2_3(a, b, c, intervalMs);
-            }
-            else
-            {
-                if (qx == null) return;
-                // compute IK and draw; InverseKinematic1 draws the arm
-                InverseKinematic1(qx[_idx], qy[_idx], orientasi[_idx]);
+                // advance to the expected index (latest). We'll show only the latest sample to UI
+                int newIdx = expectedIdx;
+                if (newIdx > _maxIndex) newIdx = _maxIndex;
 
-                // compute angles and validate then send only to servos 0,2,3
-                var (deg1, deg2, deg3) = ComputeInverseKinematicAngles(qx[_idx], qy[_idx], orientasi[_idx]);
+                // capture local copies needed for sending
+                int sendInterval = Math.Max(1, _runIntervalMs);
+                int curSpace = space;
+                int idxToShow = newIdx;
 
-                if (!ValidateJointAngles(deg1, deg2, deg3, out string jreason))
+                // update _idx now
+                _idx = idxToShow;
+
+                // For UI drawing we must marshal to UI thread
+                if (curSpace == 0)
                 {
-                    _timer.Stop();
-                    MessageBox.Show($"Planned target {_idx} produces invalid joint angles: {jreason}", "Joint limit", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    return;
+                    if (teta1 == null) return;
+                    double a = teta1[idxToShow], b = teta2![idxToShow], c = teta3![idxToShow];
+
+                    // UI update
+                    Application.Current.Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        ArmDraw(a, b, c);
+                    }));
+
+                    // send to SSC-32 if connected (only servos 0,2,3)
+                    if (_isConnected)
+                    {
+                        try
+                        {
+                            SendServos0_2_3(a, b, c, sendInterval);
+                        }
+                        catch
+                        {
+                            // ignore send errors here; connection state handled in SendRawCommand
+                        }
+                    }
+                }
+                else
+                {
+                    if (qx == null) return;
+                    double qxLocal = qx[idxToShow], qyLocal = qy[idxToShow], oriLocal = orientasi![idxToShow];
+
+                    // compute IK on background thread
+                    var (deg1, deg2, deg3) = ComputeInverseKinematicAngles(qxLocal, qyLocal, oriLocal);
+
+                    // validate then update UI and send
+                    if (!ValidateJointAngles(deg1, deg2, deg3, out string jreason))
+                    {
+                        // stop timer and show message on UI thread
+                        _stopwatch.Stop();
+                        _timer.Stop();
+                        Application.Current.Dispatcher.BeginInvoke(new Action(() =>
+                        {
+                            MessageBox.Show($"Planned target {idxToShow} produces invalid joint angles: {jreason}", "Joint limit", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        }));
+                        return;
+                    }
+
+                    // draw on UI thread
+                    Application.Current.Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        ArmDraw(deg1, deg2, deg3);
+                    }));
+
+                    if (_isConnected)
+                    {
+                        try
+                        {
+                            SendServos0_2_3(deg1, deg2, deg3, sendInterval);
+                        }
+                        catch
+                        {
+                            // ignore send errors here
+                        }
+                    }
                 }
 
-                if (_isConnected) SendServos0_2_3(deg1, deg2, deg3, intervalMs);
-            }
-
-            _idx++;
-            if (_idx > _maxIndex)
-            {
-                _timer.Stop();
+                // check for completion
+                if (_idx >= _maxIndex)
+                {
+                    _stopwatch.Stop();
+                    _timer.Stop();
+                }
             }
         }
 
@@ -512,7 +634,7 @@ namespace Trajectory
             if (idx >= teta1.Length) return;
 
             // stop animation to show static pose
-            if (_timer.IsEnabled) _timer.Stop();
+            if (_timer.Enabled) _timer.Stop();
 
             // draw selected pose
             double th1 = teta1[idx];
@@ -559,7 +681,7 @@ namespace Trajectory
             if (idx >= qx.Length) return;
 
             // stop animation to show static pose
-            if (_timer.IsEnabled) _timer.Stop();
+            if (_timer.Enabled) _timer.Stop();
 
             // compute IK angles for this workspace sample
             var (deg1, deg2, deg3) = ComputeInverseKinematicAngles(qx[idx], qy[idx], orientasi[idx]);
