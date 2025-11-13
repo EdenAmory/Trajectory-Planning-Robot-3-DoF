@@ -10,12 +10,16 @@ using System.Windows.Threading;
 using System.Globalization;
 using System.Timers;
 using System.Diagnostics;
+using System.Collections.Generic;
+using System.Text.Json;
+using System.IO;
+using Microsoft.Win32;
 
 namespace Trajectory
 {
-    /// <summary>
-    /// Interaction logic for MainWindow.xaml
-    /// </summary>
+    // DTO used for file serialization (public so System.Text.Json can instantiate)
+    public record ManualPointDto(double Qx, double Qy, double Ori);
+
     public partial class MainWindow : Window
     {
         // runtime state
@@ -58,6 +62,23 @@ namespace Trajectory
         // Each grid square represents this many millimeters (10 mm)
         private const double GridSquareMm = 10.0;
 
+        // in addition to existing arrays:
+        private List<ManualPoint> _manualPoints = new List<ManualPoint>();
+
+        // small model for manual points
+        private class ManualPoint
+        {
+            public double Qx { get; set; }
+            public double Qy { get; set; }
+            public double Ori { get; set; }
+
+            public override string ToString()
+            {
+                // compact display for the list
+                return $"{Qx:0.0}, {Qy:0.0}, {Ori:0.0}";
+            }
+        }
+
         public MainWindow()
         {
             InitializeComponent();
@@ -91,6 +112,16 @@ namespace Trajectory
             m_joint_list.SelectionChanged += M_joint_list_SelectionChanged;
             m_work_list.SelectionChanged += M_work_list_SelectionChanged;
 
+            // Manual points UI events
+            btnAddPoint.Click += BtnAddPoint_Click;
+            btnRemovePoint.Click += BtnRemovePoint_Click;
+            btnCalcManual.Click += BtnCalcManual_Click;
+            btnRunManual.Click += BtnRunManual_Click;
+            btnSavePoints.Click += BtnSavePoints_Click;
+            btnLoadPoints.Click += BtnLoadPoints_Click;
+            lbManualPoints.SelectionChanged += LbManualPoints_SelectionChanged;
+            btnUpdatePoint.Click += BtnUpdatePoint_Click;
+
             // init timer (use System.Timers.Timer + Stopwatch for higher precision)
             _timer = new System.Timers.Timer(10); // poll every 10 ms
             _timer.AutoReset = true;
@@ -112,6 +143,270 @@ namespace Trajectory
 
             // initial draw/update (may be no-op if sizes not ready)
             UpdateWorkspaceCircle();
+        }
+
+        // Add a manual point (now adds row in list)
+        private void BtnAddPoint_Click(object? sender, RoutedEventArgs e)
+        {
+            _manualPoints.Add(new ManualPoint { Qx = 0.0, Qy = 0.0, Ori = 90.0 });
+            RefreshManualList();
+            lbManualPoints.SelectedIndex = _manualPoints.Count - 1;
+        }
+
+        // Remove selected or last manual point
+        private void BtnRemovePoint_Click(object? sender, RoutedEventArgs e)
+        {
+            int sel = lbManualPoints.SelectedIndex;
+            if (sel >= 0 && sel < _manualPoints.Count)
+                _manualPoints.RemoveAt(sel);
+            else if (_manualPoints.Count > 0)
+                _manualPoints.RemoveAt(_manualPoints.Count - 1);
+
+            RefreshManualList();
+
+            // clear editor if no selection
+            if (_manualPoints.Count == 0)
+            {
+                txtManualQx.Text = txtManualQy.Text = txtManualOri.Text = string.Empty;
+            }
+            else
+            {
+                lbManualPoints.SelectedIndex = Math.Min(Math.Max(0, sel - 1), _manualPoints.Count - 1);
+            }
+        }
+
+        private void RefreshManualList()
+        {
+            lbManualPoints.Items.Clear();
+            for (int i = 0; i < _manualPoints.Count; i++)
+            {
+                lbManualPoints.Items.Add($"{i}  {_manualPoints[i].ToString()}");
+            }
+        }
+
+        private void LbManualPoints_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+        {
+            int idx = lbManualPoints.SelectedIndex;
+            if (idx < 0 || idx >= _manualPoints.Count)
+            {
+                txtManualQx.Text = txtManualQy.Text = txtManualOri.Text = string.Empty;
+                return;
+            }
+
+            var p = _manualPoints[idx];
+            txtManualQx.Text = p.Qx.ToString("0.0", CultureInfo.InvariantCulture);
+            txtManualQy.Text = p.Qy.ToString("0.0", CultureInfo.InvariantCulture);
+            txtManualOri.Text = p.Ori.ToString("0.0", CultureInfo.InvariantCulture);
+        }
+
+        // Update selected point from editor fields
+        private void BtnUpdatePoint_Click(object? sender, RoutedEventArgs e)
+        {
+            int idx = lbManualPoints.SelectedIndex;
+            if (idx < 0 || idx >= _manualPoints.Count) return;
+
+            if (!double.TryParse(txtManualQx.Text, NumberStyles.Number | NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out double qxVal))
+            {
+                MessageBox.Show("Qx tidak valid", "Input error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            if (!double.TryParse(txtManualQy.Text, NumberStyles.Number | NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out double qyVal))
+            {
+                MessageBox.Show("Qy tidak valid", "Input error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            if (!double.TryParse(txtManualOri.Text, NumberStyles.Number | NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out double oriVal))
+            {
+                MessageBox.Show("Orientasi tidak valid", "Input error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            _manualPoints[idx].Qx = qxVal;
+            _manualPoints[idx].Qy = qyVal;
+            _manualPoints[idx].Ori = oriVal;
+
+            RefreshManualList();
+            lbManualPoints.SelectedIndex = idx;
+        }
+
+        // Save manual points to JSON file
+        private void BtnSavePoints_Click(object? sender, RoutedEventArgs e)
+        {
+            if (_manualPoints.Count == 0)
+            {
+                MessageBox.Show("Tidak ada titik untuk disimpan.", "Info", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var dlg = new SaveFileDialog
+            {
+                Title = "Save manual points",
+                Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*",
+                DefaultExt = ".json",
+                FileName = "manual_points.json"
+            };
+
+            if (dlg.ShowDialog() != true) return;
+
+            try
+            {
+                var dtos = _manualPoints.Select(p => new ManualPointDto(p.Qx, p.Qy, p.Ori)).ToList();
+                var options = new JsonSerializerOptions { WriteIndented = true };
+                string json = JsonSerializer.Serialize(dtos, options);
+                File.WriteAllText(dlg.FileName, json, Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Gagal menyimpan file: " + ex.Message, "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            MessageBox.Show("Manual points saved.", "Saved", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        // Load manual points from JSON file (replaces current list)
+        private void BtnLoadPoints_Click(object? sender, RoutedEventArgs e)
+        {
+            var dlg = new OpenFileDialog
+            {
+                Title = "Load manual points",
+                Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*",
+                DefaultExt = ".json"
+            };
+
+            if (dlg.ShowDialog() != true) return;
+
+            try
+            {
+                string json = File.ReadAllText(dlg.FileName, Encoding.UTF8);
+                var dtos = JsonSerializer.Deserialize<List<ManualPointDto>>(json);
+                if (dtos == null || dtos.Count == 0)
+                {
+                    MessageBox.Show("File kosong atau format tidak dikenali.", "Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                _manualPoints = dtos.Select(d => new ManualPoint { Qx = d.Qx, Qy = d.Qy, Ori = d.Ori }).ToList();
+                RefreshManualList();
+                lbManualPoints.SelectedIndex = Math.Min(0, _manualPoints.Count - 1);
+                if (_manualPoints.Count > 0) lbManualPoints.SelectedIndex = 0;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Gagal memuat file: " + ex.Message, "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            MessageBox.Show("Manual points loaded.", "Loaded", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        // Read manual points (used by calculate/run). returns arrays built from _manualPoints
+        private bool ReadManualPoints(out double[] outQx, out double[] outQy, out double[] outOri, out string reason)
+        {
+            reason = string.Empty;
+            if (_manualPoints.Count == 0)
+            {
+                outQx = Array.Empty<double>();
+                outQy = Array.Empty<double>();
+                outOri = Array.Empty<double>();
+                reason = "Tidak ada titik manual. Tambahkan minimal satu titik.";
+                return false;
+            }
+
+            outQx = _manualPoints.Select(p => p.Qx).ToArray();
+            outQy = _manualPoints.Select(p => p.Qy).ToArray();
+            outOri = _manualPoints.Select(p => p.Ori).ToArray();
+            return true;
+        }
+
+        // Calculate manual points: validate and draw path (uses ReadManualPoints above)
+        private void BtnCalcManual_Click(object? sender, RoutedEventArgs e)
+        {
+            if (!ReadManualPoints(out double[] mx, out double[] my, out double[] mor, out string r))
+            {
+                MessageBox.Show(r, "Input error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            ReadLinkLengths();
+
+            for (int i = 0; i < mx.Length; i++)
+            {
+                if (!IsWorkspacePoseReachable(mx[i], my[i], mor[i], out string reason))
+                {
+                    MessageBox.Show($"Target ({mx[i]:0.0}, {my[i]:0.0}) with orientation {mor[i]:0.0}° is outside robot reach:\n{reason}", "Target out of reach", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                var (deg1, deg2, deg3) = ComputeInverseKinematicAngles(mx[i], my[i], mor[i]);
+                if (!ValidateJointAngles(deg1, deg2, deg3, out string jreason))
+                {
+                    MessageBox.Show($"Target ({mx[i]:0.0}, {my[i]:0.0}) with orientation {mor[i]:0.0}° produces invalid joint angles:\n{jreason}", "Joint limit", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+            }
+
+            qx = mx;
+            qy = my;
+            orientasi = mor;
+
+            m_work_list.Items.Clear();
+            for (int i = 0; i < qx.Length; i++)
+            {
+                m_work_list.Items.Add($"{i,3}  {qx[i],6:0.0} {qy[i],6:0.0} {orientasi[i],6:0.0}");
+            }
+
+            // draw path
+            DrawPathFromWorkspace(qx, qy);
+        }
+
+        // Run manual points: same as existing BtnRunManual_Click but using qx,qy,orientasi set by Calculate
+        private void BtnRunManual_Click(object? sender, RoutedEventArgs e)
+        {
+            if (qx == null || qx.Length == 0)
+            {
+                MessageBox.Show("Tidak ada titik yang dihitung. Tekan Calculate terlebih dahulu.", "Info", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            if (!int.TryParse(m_t.Text, out int totalMs) || totalMs <= 0) totalMs = 1000;
+            int N = qx.Length - 1;
+            int intervalMs = (jenis == 0) ? totalMs : Math.Max(1, totalMs / N);
+
+            // validate all planned points before starting run
+            ReadLinkLengths();
+            for (int i = 0; i <= N; i++)
+            {
+                if (!IsWorkspacePoseReachable(qx[i], qy[i], orientasi![i], out string reason))
+                {
+                    MessageBox.Show($"Planned target ({qx[i]:0.0}, {qy[i]:0.0}) with orientation {orientasi[i]:0.0}° is outside robot reach:\n{reason}", "Target out of reach", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                var (deg1, deg2, deg3) = ComputeInverseKinematicAngles(qx[i], qy[i], orientasi[i]);
+                if (!ValidateJointAngles(deg1, deg2, deg3, out string jreason))
+                {
+                    MessageBox.Show($"Planned target ({qx[i]:0.0}, {qy[i]:0.0}) with orientation {orientasi[i]:0.0}° produces invalid joint angles:\n{jreason}", "Joint limit", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+            }
+
+            space = 1;
+            _idx = 0;
+            _maxIndex = N;
+
+            // store run params for timer logic
+            _runTotalMs = totalMs;
+            _runIntervalMs = intervalMs;
+            _runN = N;
+
+            // restart stopwatch and start timer (background)
+            lock (_timerLock)
+            {
+                _stopwatch.Restart();
+                _timer.Interval = 10; // poll resolution (ms)
+                _timer.Start();
+            }
         }
 
         // ensure link-length fields reflect UI (with safe defaults)
@@ -342,7 +637,7 @@ namespace Trajectory
                 teta3[i] = t3_0 + (t3_1 - t3_0) * f;
 
                 // validate joint-limits for joint-space generation
-                if (!ValidateJointAngles(teta1[i], teta2[i], teta3[i], out string reason))
+                if (!ValidateJointAngles(teta1[i], teta2![i], teta3![i], out string reason))
                 {
                     MessageBox.Show($"Generated joint sample {i} invalid: {reason}", "Joint limit", MessageBoxButton.OK, MessageBoxImage.Warning);
                     return;
@@ -460,7 +755,7 @@ namespace Trajectory
             ReadLinkLengths();
             for (int i = 0; i <= N; i++)
             {
-                if (!IsWorkspacePoseReachable(qx[i], qy[i], orientasi[i], out string reason))
+                if (!IsWorkspacePoseReachable(qx[i], qy[i], orientasi![i], out string reason))
                 {
                     MessageBox.Show($"Planned target ({qx[i]:0.0}, {qy[i]:0.0}) with orientation {orientasi[i]:0.0}° is outside robot reach:\n{reason}", "Target out of reach", MessageBoxButton.OK, MessageBoxImage.Warning);
                     return;
@@ -623,7 +918,7 @@ namespace Trajectory
         }
 
         // ---------------------
-        // List selection handlers (new)
+        // List selection handlers
         // ---------------------
         private void M_joint_list_SelectionChanged(object? sender, SelectionChangedEventArgs e)
         {
