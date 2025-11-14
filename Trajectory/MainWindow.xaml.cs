@@ -591,6 +591,30 @@ namespace Trajectory
             SendRawCommand($"#{ch3} P1450 T1000");
         }
 
+        // Added: gripper open/close handlers referenced from XAML.
+        private void BtnBuka_Capit(object sender, RoutedEventArgs e)
+        {
+            if (!_isConnected)
+            {
+                MessageBox.Show("Port belum terbuka. Silakan Connect terlebih dahulu.");
+                return;
+            }
+
+            // Format: "#channel Pposisi T1000"
+            SendRawCommand("#4 P820 T1000");
+        }
+
+        private void BtnTutup_Capit(object sender, RoutedEventArgs e)
+        {
+            if (!_isConnected)
+            {
+                MessageBox.Show("Port belum terbuka. Silakan Connect terlebih dahulu.");
+                return;
+            }
+
+            SendRawCommand("#4 P2500 T1000");
+        }
+
         // ---------------------
         // UI handlers (trajectory, run, timer, drawing, IK)
         // ---------------------
